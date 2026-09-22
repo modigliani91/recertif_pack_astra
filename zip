@@ -4,17 +4,11 @@ import os
 import shutil
 from pathlib import Path
 
-def extract_and_rezip(zip_path, csv_path, output_zip_path, id_column_name='Id tiers', encoding='latin-1'):
+def extract_and_rezip_in_batches(zip_path, csv_path, output_dir, id_column_name='Id tiers',
+                                  encoding='latin-1', batch_size=100, base_name='recertif_filtered'):
     """
     Extract only folders from a zip file whose names match client IDs in a CSV file,
-    then create a new zip file with those folders.
-    
-    Args:
-        zip_path: Path to the input zip file
-        csv_path: Path to the CSV file
-        output_zip_path: Path for the output zip file
-        id_column_name: Name of the column containing client IDs in the CSV
-        encoding: Encoding of the CSV file (default: latin-1)
+    then create multiple zip files with `batch_size` folders each.
     """
     
     # Step 1: Read the CSV file and collect all client IDs
@@ -22,7 +16,6 @@ def extract_and_rezip(zip_path, csv_path, output_zip_path, id_column_name='Id ti
     client_ids = set()
     
     with open(csv_path, 'r', encoding=encoding) as csvfile:
-        # Try to detect the delimiter (comma, semicolon, or tab)
         sample = csvfile.read(4096)
         csvfile.seek(0)
         
@@ -35,123 +28,145 @@ def extract_and_rezip(zip_path, csv_path, output_zip_path, id_column_name='Id ti
         print(f"Using delimiter: '{delimiter}'")
         reader = csv.DictReader(csvfile, delimiter=delimiter)
         
-        # Check if the column exists
         if id_column_name not in reader.fieldnames:
-            # Try to find a matching column (case-insensitive)
             matching = [f for f in reader.fieldnames if f.strip().lower() == id_column_name.strip().lower()]
             if matching:
                 id_column_name = matching[0]
                 print(f"Found column: '{id_column_name}'")
             else:
-                raise ValueError(f"Column '{id_column_name}' not found. Available columns: {reader.fieldnames}")
+                raise ValueError(f"Column '{id_column_name}' not found. Available: {reader.fieldnames}")
         
         for row in reader:
             client_id = row[id_column_name].strip()
             if client_id:
                 client_ids.add(client_id)
     
-    print(f"Found {len(client_ids)} unique client IDs in the CSV file.")
+    print(f"Found {len(client_ids)} unique client IDs in CSV.")
     
-    # Step 2: Create a temporary extraction directory
-    temp_dir = Path('temp_extracted_clients')
-    if temp_dir.exists():
-        shutil.rmtree(temp_dir)
-    temp_dir.mkdir(parents=True)
-    
-    # Step 3: Extract only matching folders from the zip
-    print("\nExtracting matching folders from zip...")
-    extracted_count = 0
-    matched_client_ids = set()
-    
+    # Step 2: Determine which top-level folders to extract
+    print("\nScanning zip for matching folders...")
     with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        # Get all unique top-level folder names in the zip
         top_level_folders = set()
         for name in zip_ref.namelist():
-            # Get the first part of the path (top-level folder/file)
             parts = name.replace('\\', '/').split('/')
             if parts[0]:
                 top_level_folders.add(parts[0])
         
         print(f"Found {len(top_level_folders)} top-level items in the zip.")
         
-        # Determine which folders match client IDs
         folders_to_extract = []
+        matched_client_ids = set()
         for folder in top_level_folders:
-            # Try direct match and also match without extension (in case folder has extension)
             folder_name = folder.strip()
             if folder_name in client_ids:
                 folders_to_extract.append(folder)
                 matched_client_ids.add(folder_name)
             else:
-                # Sometimes folder names have trailing slashes or other variations
-                # Try matching the base name
-                base_name = os.path.splitext(folder_name)[0]
-                if base_name in client_ids:
+                base_name_folder = os.path.splitext(folder_name)[0]
+                if base_name_folder in client_ids:
                     folders_to_extract.append(folder)
-                    matched_client_ids.add(base_name)
+                    matched_client_ids.add(base_name_folder)
         
-        print(f"Matched {len(folders_to_extract)} folders to extract.")
-        
-        # Extract matching folders
+        print(f"Matched {len(folders_to_extract)} folders.")
+    
+    # Sort folders for deterministic batching
+    folders_to_extract.sort()
+    
+    # Step 3: Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    
+    # Step 4: Create a temp directory for extraction
+    temp_dir = Path('temp_extracted_clients')
+    if temp_dir.exists():
+        shutil.rmtree(temp_dir)
+    temp_dir.mkdir(parents=True)
+    
+    # Step 5: Extract ALL matching folders first (or you can do it batch by batch)
+    print("\nExtracting matching folders from zip...")
+    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+        # Build a set for fast lookup
+        folders_set = set(folders_to_extract)
         for name in zip_ref.namelist():
-            # Check if this file belongs to a folder we want to extract
             parts = name.replace('\\', '/').split('/')
-            top_folder = parts[0]
-            
-            if top_folder in folders_to_extract:
+            if parts[0] in folders_set:
                 try:
                     zip_ref.extract(name, temp_dir)
-                    extracted_count += 1
                 except Exception as e:
-                    print(f"Warning: Could not extract {name}: {e}")
+                    print(f"Warning: could not extract {name}: {e}")
     
-    print(f"Extracted {extracted_count} files/folders.")
+    # Step 6: Split into batches and create zip files
+    total_folders = len(folders_to_extract)
+    num_batches = (total_folders + batch_size - 1) // batch_size  # ceil division
     
-    # Step 4: Create the new zip file
-    print(f"\nCreating output zip file: {output_zip_path}")
+    print(f"\nCreating {num_batches} zip file(s) with up to {batch_size} folders each...")
     
-    with zipfile.ZipFile(output_zip_path, 'w', zipfile.ZIP_DEFLATED) as new_zip:
-        for root, dirs, files in os.walk(temp_dir):
-            for file in files:
-                file_path = os.path.join(root, file)
-                # Calculate the relative path for the archive
-                arcname = os.path.relpath(file_path, temp_dir)
-                new_zip.write(file_path, arcname)
+    for batch_index in range(num_batches):
+        start = batch_index * batch_size
+        end = min(start + batch_size, total_folders)
+        batch_folders = folders_to_extract[start:end]
+        
+        # Determine zip filename (with zero-padded number if multiple batches)
+        if num_batches == 1:
+            zip_filename = f"{base_name}.zip"
+        else:
+            zip_filename = f"{base_name}_part{batch_index + 1:02d}.zip"
+        
+        zip_filepath = output_path / zip_filename
+        
+        print(f"  [{batch_index + 1}/{num_batches}] Creating {zip_filename} "
+              f"({len(batch_folders)} folders: {batch_folders[0]} ... {batch_folders[-1]})")
+        
+        with zipfile.ZipFile(zip_filepath, 'w', zipfile.ZIP_DEFLATED) as new_zip:
+            for folder in batch_folders:
+                folder_path = temp_dir / folder
+                if not folder_path.exists():
+                    print(f"    Warning: {folder} not found in temp dir, skipping.")
+                    continue
+                
+                for root, dirs, files in os.walk(folder_path):
+                    for file in files:
+                        file_path = os.path.join(root, file)
+                        arcname = os.path.relpath(file_path, temp_dir)
+                        new_zip.write(file_path, arcname)
     
-    print(f"Done! Created {output_zip_path}")
-    
-    # Step 5: Clean up temporary directory
-    print("Cleaning up temporary files...")
+    # Step 7: Clean up
+    print("\nCleaning up temporary files...")
     shutil.rmtree(temp_dir)
     
-    # Report client IDs that were in the CSV but not found in the zip
+    # Report missing IDs
     missing_ids = client_ids - matched_client_ids
     if missing_ids:
-        print(f"\nWarning: {len(missing_ids)} client IDs from CSV were not found in the zip:")
-        for cid in list(missing_ids)[:20]:  # Show first 20
+        print(f"\nWarning: {len(missing_ids)} client IDs from CSV not found in zip:")
+        for cid in list(missing_ids)[:20]:
             print(f"  - {cid}")
         if len(missing_ids) > 20:
             print(f"  ... and {len(missing_ids) - 20} more")
     
     print(f"\nSummary:")
-    print(f"  Client IDs in CSV: {len(client_ids)}")
-    print(f"  Folders extracted: {len(folders_to_extract)}")
-    print(f"  Files written to new zip: {sum(len(files) for _, _, files in os.walk(temp_dir))}")
+    print(f"  Client IDs in CSV:      {len(client_ids)}")
+    print(f"  Folders matched:        {len(folders_to_extract)}")
+    print(f"  Zip files created:      {num_batches}")
+    print(f"  Output directory:       {output_path.resolve()}")
 
 
 if __name__ == "__main__":
-    # ==== CONFIGURE THESE PATHS ====
+    # ==== CONFIGURE THESE ====
     ZIP_PATH = "recertif.zip"
-    CSV_PATH = "clients.csv"          # Change to your CSV filename
-    OUTPUT_ZIP_PATH = "recertif_filtered.zip"
-    ID_COLUMN = "Id tiers"            # Exact column name in your CSV
-    CSV_ENCODING = "latin-1"          # Or "iso-8859-1", "cp1252", etc.
-    # ===============================
+    CSV_PATH = "clients.csv"
+    OUTPUT_DIR = "output_zips"          # Folder where zip files will be created
+    ID_COLUMN = "Id tiers"
+    CSV_ENCODING = "latin-1"
+    BATCH_SIZE = 100                    # Folders per zip
+    BASE_NAME = "recertif_filtered"     # Prefix for zip filenames
+    # =========================
     
-    extract_and_rezip(
+    extract_and_rezip_in_batches(
         zip_path=ZIP_PATH,
         csv_path=CSV_PATH,
-        output_zip_path=OUTPUT_ZIP_PATH,
+        output_dir=OUTPUT_DIR,
         id_column_name=ID_COLUMN,
-        encoding=CSV_ENCODING
+        encoding=CSV_ENCODING,
+        batch_size=BATCH_SIZE,
+        base_name=BASE_NAME
     )
