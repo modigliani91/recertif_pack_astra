@@ -1,0 +1,91 @@
+def load_reference_csv(path: Path) -> dict:
+    """Détection contrôlée contre les colonnes requises ; csv.reader conserve les zéros."""
+    payload = Path(path).read_bytes()
+    
+    # 1. Correction : Toujours inclure latin-1 et iso-8859-1 dans la liste
+    if CFG.REFERENCE_ENCODING != "auto":
+        encodings = [CFG.REFERENCE_ENCODING]
+    else:
+        encodings = ["utf-8-sig", "cp1252"]
+        
+    for enc in ["iso-8859-1", "latin-1"]:
+        if enc not in encodings:
+            encodings.append(enc)
+
+    separators = [CFG.REFERENCE_SEPARATOR] if CFG.REFERENCE_SEPARATOR else [";", ",", "\t", "|"]
+    required = {normalize_name(c): c for c in REFERENCE_COLUMNS}
+    failures = []
+    chosen = None
+    
+    for encoding in encodings:
+        try:
+            text = payload.decode(encoding, errors="strict")
+        except UnicodeDecodeError as exc:
+            failures.append(f"{encoding}: {exc}")
+            continue
+            
+        # 2. Correction : Suppression du blocage C1 qui rejetait les fichiers Latin-1
+        # (Les anciennes lignes if any("\u0080" <= c <= "\u009f"...) ont été retirées)
+        
+        matches = []
+        for sep in separators:
+            try:
+                reader = csv.reader(io.StringIO(text, newline=""), delimiter=sep, strict=True)
+                header = next(reader)
+                normalized = [normalize_name(c.lstrip("\ufeff")) for c in header]
+                if len(normalized) != len(set(normalized)) or not set(required).issubset(normalized):
+                    continue
+                    
+                records = []
+                for values in reader:
+                    if not values:
+                        continue
+                    if len(values) != len(header):
+                        raise ValueError(f"Ligne CSV {reader.line_num}: {len(values)} valeurs pour {len(header)} colonnes")
+                    row = {required.get(norm, original): v for norm, original, v in zip(normalized, header, values)}
+                    records.append({"row_number": reader.line_num, "values": row})
+                
+                matches.append((sep, records, header))
+            except (csv.Error, StopIteration, ValueError) as exc:
+                failures.append(f"{encoding}/{sep!r}: {exc}")
+                
+        if len(matches) > 1:
+            raise ValueError("Plusieurs séparateurs satisfont le schéma ; définir REFERENCE_SEPARATOR.")
+            
+        if matches:
+            chosen = (encoding, *matches[0])
+            break
+            
+    if chosen is None:
+        raise ValueError("CSV non lisible ou colonnes absentes. Colonnes requises : " + str(REFERENCE_COLUMNS) + "; " + " | ".join(failures))
+        
+    encoding, separator, rows, header = chosen
+    index, missing_ids, repairs = defaultdict(list), [], []
+    
+    for row in rows:
+        raw = row["values"].get("Id tiers")
+        id_info = normalize_identifier(raw, "customer", repair_decimal=CFG.REPAIR_LEGACY_DECIMAL_IDS)
+        row["id_normalization"] = id_info
+        if id_info["repair"]:
+            repairs.append({"row_number": row["row_number"], **id_info["repair"]})
+            
+        if id_info["status"] == "VALID":
+            index[id_info["normalized"]].append(row)
+        else:
+            missing_ids.append(row)
+            
+    duplicates = [{"normalized_id": key, "row_count": len(group), "rows": group,
+                   "conflicting": len({stable_hash({c: r["values"][c] for c in REFERENCE_COLUMNS if c != "Id tiers"}) for r in group}) > 1}
+                  for key, group in index.items() if len(group) > 1]
+                  
+    result = {"path": str(Path(path).resolve()), "sha256": hashlib.sha256(payload).hexdigest(),
+              "encoding": encoding, "separator": separator, "row_count": len(rows), "columns": header,
+              "rows": rows, "index": dict(index), "missing_id_rows": missing_ids,
+              "duplicates": duplicates, "repairs": repairs}
+              
+    print("CSV :", path, "| encodage :", encoding, "| séparateur :", repr(separator))
+    print("Colonnes réelles :", header, "| colonnes requises manquantes :", [])
+    print("Lignes :", len(rows), "| Id tiers dupliqués :", len(duplicates),
+          "| lignes sans ID exploitable :", len(missing_ids), "| réparations textuelles :", len(repairs))
+          
+    return result
